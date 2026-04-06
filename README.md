@@ -142,7 +142,7 @@ python train_dsci.py \
 | `--no-preview` | off | Skip preview generation after training |
 | `--preview_checkpoints` | off | Generate previews for each checkpoint |
 | `--init_from` | none | Initialize from a previous embedding (phased training) |
-| `--use_captions` | off | Use `.txt` caption files alongside images (not required — filename-derived prompts are used by default) |
+| `--use_captions` | off | Use `.txt` caption files alongside images (not required) |
 
 **LR schedules:** `constant`, `warmup_constant`, `warmup_linear_decay`, `one_cycle`, `warmup_exp_decay`, `cosine_restarts`
 
