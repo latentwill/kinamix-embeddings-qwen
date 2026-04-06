@@ -1,24 +1,22 @@
 # Kinamix Embeddings for Qwen-Image
 
-Train custom concept embeddings for **Qwen-Image** (MM-DiT + Qwen2.5-VL text encoder). Teaches the model new visual concepts — styles, textures, objects — through learned embedding tokens injected directly into the DiT's conditioning space. No model fine-tuning required.
+Train custom concept embeddings for **Qwen-Image** (MM-DiT + Qwen2.5-VL text encoder) using **DSCI (DiT-Side Concept Injection)**. Teaches the model new visual concepts — styles, textures, objects — through learned embedding tokens injected directly into the DiT's conditioning space.
 
-## Why Embeddings Over LoRA?
+## Why Embeddings?
 
-LoRA modifies the model's weights directly. Every LoRA is tied to one specific model checkpoint, and stacking multiple LoRAs creates interference and quality loss.
-
-Embeddings work differently — they operate in the model's **conditioning space**, not its weight space:
+Embeddings operate in the model's **conditioning space**, not its weight space:
 
 - **No weight modification.** The base model stays completely frozen. Your concept lives as a small portable file.
-- **Composable.** Multiple embeddings can coexist in the same prompt without interference.
+- **Composable.** Multiple embeddings can coexist in the same prompt without interference, and work alongside LoRA.
 - **Tiny files.** A trained embedding is ~56 KB vs ~100-500 MB for a LoRA.
 - **Model-agnostic within architecture.** An embedding trained on Qwen-Image works with any checkpoint sharing the same text encoder + DiT architecture.
-- **Fast to train.** 500-1000 steps, 5-15 minutes on an A40. No large datasets or overnight runs.
+- **Easy to train.** 5-20 images, 4000-10000 steps on an A40.
 
 The trade-off: embeddings have a narrower influence than LoRA. They're best for styles, textures, and visual motifs rather than fine anatomical detail.
 
 ## How It Works
 
-**DiT-Side Concept Injection (DSCI)** trains N learnable tokens that are concatenated to the text encoder's output before entering the DiT transformer. The text encoder stays completely frozen — gradients flow through the DiT back to the concept tokens only.
+DSCI trains N learnable tokens that are concatenated to the text encoder's output before entering the DiT (Diffusion Transformer). The text encoder stays completely frozen — gradients flow through the DiT back to the concept tokens only.
 
 This bypasses the language model's attractor basins, giving concepts more freedom to encode visual features that don't map cleanly to words.
 
@@ -75,11 +73,11 @@ mkdir -p /workspace/training
 python train_dsci.py \
     --image_dir /workspace/training \
     --output_path /workspace/output/my_concept.safetensors \
-    --steps 1000 \
+    --steps 5000 \
     --lr 1.85e-4 \
     --num_tokens 5 \
     --lr_schedule one_cycle \
-    --checkpoint_interval 250 \
+    --checkpoint_interval 1000 \
     --precision full
 ```
 
@@ -87,7 +85,7 @@ Training produces:
 - `my_concept.safetensors` — the trained embedding (~56 KB)
 - `my_concept_metrics.csv` — per-step loss and learning rate data
 - `preview_my_concept/` — auto-generated preview images
-- Checkpoint files at every 250 steps
+- Checkpoint files at each interval
 
 ### 5. Generate images
 
@@ -120,7 +118,7 @@ Download the output directory via RunPod file manager, `scp`, or `rsync`.
 python train_dsci.py \
     --image_dir ./my_images \
     --output_path ./output/my_concept.safetensors \
-    --steps 1000 \
+    --steps 5000 \
     --lr 1.85e-4 \
     --num_tokens 5 \
     --lr_schedule one_cycle \
@@ -144,7 +142,7 @@ python train_dsci.py \
 | `--no-preview` | off | Skip preview generation after training |
 | `--preview_checkpoints` | off | Generate previews for each checkpoint |
 | `--init_from` | none | Initialize from a previous embedding (phased training) |
-| `--use_captions` | off | Use `.txt` caption files alongside images |
+| `--use_captions` | off | Use `.txt` caption files alongside images (not required — filename-derived prompts are used by default) |
 
 **LR schedules:** `constant`, `warmup_constant`, `warmup_linear_decay`, `one_cycle`, `warmup_exp_decay`, `cosine_restarts`
 
@@ -153,7 +151,7 @@ python train_dsci.py \
 For style concepts with 10-20 images:
 
 ```bash
---steps 1000 --lr 1.85e-4 --num_tokens 5 --lr_schedule one_cycle
+--steps 5000 --lr 1.85e-4 --num_tokens 5 --lr_schedule one_cycle
 ```
 
 For quick tests (verify pipeline works):
@@ -271,13 +269,12 @@ print(emb.tokens.shape)  # torch.Size([5, 3584])
 - Square crops work best; images are resized to `--image_size` (default 512)
 - Supported formats: `.png`, `.jpg`, `.jpeg`, `.webp`
 - Place in a flat directory (no subdirectories needed)
-- For caption-based training (`--use_captions`): place `.txt` files alongside images with matching filenames
 
 ## VRAM Usage
 
 Training uses three-phase VRAM isolation to fit within GPU memory:
 
-1. **Phase A:** VAE loads alone, caches all image latents to disk, then unloads
+1. **Phase A:** VAE (Variational Autoencoder) loads alone, caches all image latents to disk, then unloads
 2. **Phase B:** Text encoder + DiT load for training (VAE never on GPU)
 3. **Phase C:** For preview generation, text encoder + DiT offload to CPU, VAE reloads
 
