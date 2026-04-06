@@ -316,6 +316,12 @@ kinamix-embeddings-qwen/
     prompts_object.txt    # Object concept prompt templates
 ```
 
+## ComfyUI Integration
+
+Use trained embeddings in ComfyUI with the companion node pack:
+
+**[kinamix-embeddings-comfyui](https://github.com/latentwill/kinamix-embeddings-comfyui)** — Load `.safetensors` embeddings and apply DSCI concept injection in ComfyUI workflows.
+
 ## License
 
 MIT
