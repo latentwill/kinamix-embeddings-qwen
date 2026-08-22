@@ -175,9 +175,20 @@ def _denoise(
     width: int,
     num_steps: int,
     show_progress: bool = False,
+    negative_hidden_states: torch.Tensor | None = None,
+    negative_mask: torch.Tensor | None = None,
+    true_cfg_scale: float = 1.0,
+    cfg_normalization: bool = True,
 ) -> torch.Tensor:
     """
-    Run the denoising loop (flow matching Euler discrete).
+    Run the denoising loop (flow matching Euler discrete), optionally with
+    the official true-CFG negative rail.
+
+    With a negative rail and ``true_cfg_scale > 1`` each step computes
+        comb = v_neg + true_cfg_scale * (v_pos - v_neg)
+    followed by the official per-token norm rescale to ``||v_pos||`` —
+    matching stock QwenImagePipeline. Without them this is single-pass
+    conditional denoising (guidance scale 1).
 
     Args:
         transformer: QwenImageTransformer2DModel (frozen).
@@ -185,13 +196,19 @@ def _denoise(
         latents: Packed noisy latents [B, seq, C*4].
         hidden_states: Text encoder output [B, seq, hidden_dim].
         attention_mask: Text attention mask [B, seq].
-        height: Image height in pixels.
-        width: Image width in pixels.
+        height, width: Pixel dimensions.
         num_steps: Number of denoising steps.
+        negative_hidden_states / negative_mask: Encoded negative prompt.
+        true_cfg_scale: Standard CFG weight; >1 enables the negative rail.
+        cfg_normalization: Rescale combined prediction to ||v_pos|| per token.
 
     Returns:
         Denoised packed latents [B, seq, C*4].
     """
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg and (negative_hidden_states is None or negative_mask is None):
+        raise ValueError("true_cfg_scale > 1 requires encoded negative states/mask")
+
     # Compute mu for dynamic shifting (required by QwenImage scheduler)
     image_seq_len = latents.shape[1]
     base_seq_len = getattr(scheduler.config, "base_image_seq_len", 256)
@@ -208,6 +225,16 @@ def _denoise(
     # height/width are pixel dimensions, latent space is /8, patchify is /2
     img_shapes = [(1, height // 16, width // 16)]
 
+    def _forward(hs: torch.Tensor, mask: torch.Tensor, t_in: torch.Tensor) -> torch.Tensor:
+        return transformer(
+            hidden_states=latents,
+            timestep=t_in,
+            encoder_hidden_states=hs,
+            encoder_hidden_states_mask=mask,
+            img_shapes=img_shapes,
+            return_dict=False,
+        )[0]
+
     timesteps = scheduler.timesteps
     if show_progress:
         timesteps = tqdm(timesteps, desc="Denoising", leave=False)
@@ -215,14 +242,15 @@ def _denoise(
     for t in timesteps:
         # Pipeline divides timestep by 1000 before passing to transformer
         timestep = t.expand(latents.shape[0]).to(latents.dtype) / 1000
-        noise_pred = transformer(
-            hidden_states=latents,
-            timestep=timestep,
-            encoder_hidden_states=hidden_states,
-            encoder_hidden_states_mask=attention_mask,
-            img_shapes=img_shapes,
-            return_dict=False,
-        )[0]
+        noise_pred = _forward(hidden_states, attention_mask, timestep)
+        if use_true_cfg:
+            neg_pred = _forward(negative_hidden_states, negative_mask, timestep)
+            comb = neg_pred.float() + true_cfg_scale * (noise_pred.float() - neg_pred.float())
+            if cfg_normalization:
+                cond_norm = torch.linalg.vector_norm(noise_pred.float(), dim=-1, keepdim=True)
+                new_norm = torch.linalg.vector_norm(comb, dim=-1, keepdim=True)
+                comb = comb * (cond_norm / new_norm.clamp(min=1e-8))
+            noise_pred = comb.to(latents.dtype)
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     return latents
@@ -239,8 +267,8 @@ def _denoise_cfg(
     height: int,
     width: int,
     num_steps: int,
-    text_scale: float,
-    concept_scale: float,
+    text_scale: float = 1.0,
+    concept_scale: float = 3.5,
     show_progress: bool = False,
     concept_scale_schedule: str = "constant",
     scale_high: float = 3.0,
@@ -249,47 +277,77 @@ def _denoise_cfg(
     scale_low_freq: float = 2.0,
     scale_high_freq: float = 3.0,
     fft_cutoff: float = 0.3,
+    negative_hidden_states: torch.Tensor | None = None,
+    negative_mask: torch.Tensor | None = None,
+    true_cfg_scale: float = 4.0,
+    cfg_normalization: bool = True,
 ) -> torch.Tensor:
     """
-    Run the denoising loop with concept scale guidance.
+    Denoising loop with true-CFG negative rail and decomposed concept guidance.
 
-    Qwen-Image is a flow matching model without classifier-free guidance
-    training, so there is no unconditional pass. Instead, we compare
-    text-only vs text+concept predictions:
+    Qwen-Image is trained for *true classifier-free guidance*: the official
+    pipeline encodes a (possibly empty) negative prompt separately and steps
+    with ``neg + true_cfg * (pos - neg)``, followed by a norm-rescale of the
+    combined prediction back to the positive prediction's magnitude. Skipping
+    that rail changes global statistics (contrast, saturation, prompt
+    adherence) versus stock generations.
 
     Per timestep:
-      1. v_text = transformer(latents, t, text_hs, text_mask)
-      2. v_full = transformer(latents, t, concept_hs, concept_mask)
-      3. v_guided = v_text + concept_scale * (v_full - v_text)
-      4. latents = scheduler.step(v_guided, t, latents)
+      1. v_pos   = transformer(latents, t, concept_hs)     # text + concept
+      2. v_neg   = transformer(latents, t, negative_hs)    # real CFG baseline
+      3. v_text  = transformer(latents, t, text_hs)        # concept-free positive
+      4. comb    = v_neg + true_cfg_scale * (v_pos - v_neg)
+      5. guided  = v_neg + (true_cfg_scale - 1) * (v_pos - v_neg)
+                 + text_scale * (v_text - v_neg)
+                 + concept_scale * (v_full - v_text)       # see note
+      6. optional norm rescale of `guided` to ||v_pos||
+      7. latents = scheduler.step(guided, t, latents)
 
-    concept_scale=0 → pure text (baseline)
-    concept_scale=1 → standard DSCI injection
-    concept_scale>1 → amplified concept (extrapolation)
+    The concept term reuses ``(v_full - v_text)`` from step 3/1 so the concept
+    knob stays independent of both text and unconditional guidance:
+
+        guided = v_neg + (true_cfg-1)*(v_pos - v_neg)
+                 + text_scale*(v_text - v_neg)
+                 + concept_scale*(v_full - v_text)
+
+    With ``concept_scale=0`` and ``text_scale=true_cfg`` this collapses to the
+    official two-term equation. With ``true_cfg=1`` it reduces to the old
+    behavior plus an explicit negative rail.
+
+    ``text_scale`` is now APPLIED. Historical versions accepted it but never
+    used it, silently running text guidance at 1.0 — that bug is fixed here.
 
     Args:
         transformer: QwenImageTransformer2DModel (frozen).
         scheduler: FlowMatchEulerDiscreteScheduler.
         latents: Packed noisy latents [B, seq, C*4].
-        text_hidden_states: Text-only encoder output [B, seq, hidden_dim].
-        text_mask: Text-only attention mask [B, seq].
-        concept_hidden_states: Text+concept encoder output [B, seq, hidden_dim].
-        concept_mask: Text+concept attention mask [B, seq].
-        height: Image height in pixels.
-        width: Image width in pixels.
+        text_hidden_states: Text-only encoder output [B, S, D].
+        text_mask: Text-only attention mask [B, S].
+        concept_hidden_states: Text+concept encoder output [B, S+N, D].
+        concept_mask: Concept attention mask [B, S+N].
+        height, width: Pixel dimensions of the target image.
         num_steps: Number of denoising steps.
-        text_scale: Guidance scale for text component.
-        concept_scale: Guidance scale for concept component (used when
-            concept_scale_schedule == "constant").
-        concept_scale_schedule: Timestep-dependent schedule for concept scale.
-            "constant" uses the fixed concept_scale value (backward compatible).
-            "linear", "cosine", "step" interpolate between scale_high and scale_low.
-        scale_high: Scale at t=1.0 (high noise) for non-constant schedules.
-        scale_low: Scale at t=0.0 (low noise) for non-constant schedules.
+        text_scale: Guidance amplifying (v_text - v_neg). Applied only when a
+            negative rail is present; otherwise text guidance stays at 1.0.
+        concept_scale: Concept guidance amplifying (v_full - v_text).
+        concept_scale_schedule: "constant" | "linear" | "cosine" | "step".
+        scale_high / scale_low: Endpoints for non-constant schedules.
+        negative_hidden_states / negative_mask: Encoded negative prompt. When
+            omitted, an empty-string encoding is produced by the caller; this
+            function requires them whenever ``true_cfg_scale > 1``.
+        true_cfg_scale: Standard CFG weight on (v_pos - v_neg).
+        cfg_normalization: Rescale the combined prediction to ||v_pos|| per
+            token, matching the official pipeline's behavior.
 
     Returns:
         Denoised packed latents [B, seq, C*4].
     """
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg and (negative_hidden_states is None or negative_mask is None):
+        raise ValueError(
+            "true_cfg_scale > 1 requires encoded negative_hidden_states/negative_mask"
+        )
+
     # Compute mu for dynamic shifting (same as _denoise)
     image_seq_len = latents.shape[1]
     base_seq_len = getattr(scheduler.config, "base_image_seq_len", 256)
@@ -307,6 +365,16 @@ def _denoise_cfg(
 
     from modules.scale_schedules import get_concept_scale
 
+    def _forward(hs: torch.Tensor, mask: torch.Tensor, t_in: torch.Tensor) -> torch.Tensor:
+        return transformer(
+            hidden_states=latents,
+            timestep=t_in,
+            encoder_hidden_states=hs,
+            encoder_hidden_states_mask=mask,
+            img_shapes=img_shapes,
+            return_dict=False,
+        )[0]
+
     timesteps_raw = scheduler.timesteps
     num_timesteps = len(timesteps_raw)
 
@@ -321,39 +389,49 @@ def _denoise_cfg(
         # t_normalized: 1.0 at the start (high noise) → 0.0 at the end (clean image).
         if concept_scale_schedule != "constant":
             t_normalized = 1.0 - (i / (num_timesteps - 1)) if num_timesteps > 1 else 0.5
-            current_scale = get_concept_scale(
+            current_concept_scale = get_concept_scale(
                 t_normalized,
                 schedule=concept_scale_schedule,
                 scale_high=scale_high,
                 scale_low=scale_low,
             )
         else:
-            current_scale = concept_scale
+            current_concept_scale = concept_scale
 
-        # 1. Text-only pass (baseline)
-        v_text = transformer(
-            hidden_states=latents,
-            timestep=timestep,
-            encoder_hidden_states=text_hidden_states,
-            encoder_hidden_states_mask=text_mask,
-            img_shapes=img_shapes,
-            return_dict=False,
-        )[0]
+        # 1. Full pass: text + concept (the positive rail carrying the concept)
+        v_pos = _forward(concept_hidden_states, concept_mask, timestep)
 
-        # 2. Full (text + concept) pass
-        v_full = transformer(
-            hidden_states=latents,
-            timestep=timestep,
-            encoder_hidden_states=concept_hidden_states,
-            encoder_hidden_states_mask=concept_mask,
-            img_shapes=img_shapes,
-            return_dict=False,
-        )[0]
+        if use_true_cfg:
+            # 2. Negative/unconditional rail — restores stock Qwen-Image behavior
+            v_neg = _forward(negative_hidden_states, negative_mask, timestep)
+            # 3. Concept-free positive pass (also feeds the concept direction)
+            v_text = _forward(text_hidden_states, text_mask, timestep)
 
-        # 3. Concept guidance
-        v_guided = v_text + current_scale * (v_full - v_text)
+            # 4. Decomposed guidance. The text rail keeps the official CFG
+            #    weight; the concept direction rides on top at its own scale:
+            #      v = v_neg + text_scale*(v_text - v_neg)
+            #          + concept_scale*(v_pos - v_text)
+            #    With concept_scale=0 this is EXACTLY stock true-CFG on the
+            #    plain prompt (v_text replaces v_pos); with both scales equal
+            #    to T it equals neg + T*(pos - neg) — full-positive stock.
+            v_guided = (
+                v_neg.to(torch.float32)
+                + text_scale * (v_text.float() - v_neg.float())
+                + current_concept_scale * (v_pos.float() - v_text.float())
+            ).to(v_pos.dtype)
+            reference = v_pos
+        else:
+            # No negative rail: plain decomposed guidance on top of v_text.
+            v_text = _forward(text_hidden_states, text_mask, timestep)
+            v_guided = v_text + (current_concept_scale * (v_pos.float() - v_text.float())).to(v_pos.dtype)
+            reference = v_pos
 
-        # 4. Scheduler step
+        if cfg_normalization and use_true_cfg:
+            ori_norm = torch.linalg.vector_norm(reference.float(), dim=-1, keepdim=True)
+            new_norm = torch.linalg.vector_norm(v_guided.float(), dim=-1, keepdim=True)
+            v_guided = (v_guided.float() * (ori_norm / new_norm.clamp(min=1e-8))).to(latents.dtype)
+
+        # Scheduler step
         latents = scheduler.step(v_guided, t, latents, return_dict=False)[0]
 
     return latents
@@ -409,12 +487,15 @@ def generate_preview(
     title: str | None = None,
     show_progress: bool = True,
     concept_scale: float = 3.5,
+    negative_prompt: str = "",
+    true_cfg_scale: float = 4.0,
+    text_scale: float = 4.0,
+    cfg_normalization: bool = True,
     concept_scale_schedule: str = "constant",
     scale_high: float = 3.0,
     scale_low: float = 1.5,
 ) -> dict:
-    """
-    Generate preview grids: one with concept applied, one baseline (no concept).
+    """Generate preview grids: one with concept applied, one baseline (no concept).
 
     By default uses CFG decomposition (concept_scale=3.5) which produces
     visible concept signal. Set concept_scale=1.0 for single-pass injection.
@@ -472,7 +553,14 @@ def generate_preview(
     pairs = [(p, s) for p in prompts for s in seeds]
     outer = tqdm(pairs, desc="Generating previews", disable=not show_progress)
 
+
     use_cfg = concept_scale != 1.0
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg:
+        with torch.no_grad():
+            neg_hs, neg_mask = encode_prompt(
+                text_encoder, tokenizer, negative_prompt, device
+            )
 
     for prompt, seed in outer:
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -504,12 +592,16 @@ def generate_preview(
                     hidden_states, attention_mask,
                     concept_hs, concept_mask,
                     height, width, steps,
-                    text_scale=1.0,
+                    text_scale=text_scale if use_true_cfg else 1.0,
                     concept_scale=concept_scale,
                     show_progress=show_progress,
                     concept_scale_schedule=concept_scale_schedule,
                     scale_high=scale_high,
                     scale_low=scale_low,
+                    negative_hidden_states=neg_hs if use_true_cfg else None,
+                    negative_mask=neg_mask if use_true_cfg else None,
+                    true_cfg_scale=true_cfg_scale,
+                    cfg_normalization=cfg_normalization,
                 )
             else:
                 denoised_concept = _denoise(
@@ -517,6 +609,10 @@ def generate_preview(
                     packed_concept, concept_hs, concept_mask,
                     height, width, steps,
                     show_progress=show_progress,
+                    negative_hidden_states=neg_hs if use_true_cfg else None,
+                    negative_mask=neg_mask if use_true_cfg else None,
+                    true_cfg_scale=true_cfg_scale,
+                    cfg_normalization=cfg_normalization,
                 )
             concept_img = _latents_to_pil(vae, denoised_concept, height, width)
 
@@ -539,6 +635,10 @@ def generate_preview(
                 packed_baseline, hidden_states, attention_mask,
                 height, width, steps,
                 show_progress=show_progress,
+                negative_hidden_states=neg_hs if use_true_cfg else None,
+                negative_mask=neg_mask if use_true_cfg else None,
+                true_cfg_scale=true_cfg_scale,
+                cfg_normalization=cfg_normalization,
             )
             baseline_img = _latents_to_pil(vae, denoised_baseline, height, width)
 
@@ -610,13 +710,13 @@ def generate_preview_cfg(
     height: int = 512,
     title: str | None = None,
     show_progress: bool = True,
+    negative_prompt: str = "",
+    true_cfg_scale: float = 4.0,
+    text_scale: float = 4.0,
+    cfg_normalization: bool = True,
     concept_scale_schedule: str = "constant",
     scale_high: float = 3.0,
     scale_low: float = 1.5,
-    decomposition: str = "standard",
-    scale_low_freq: float = 2.0,
-    scale_high_freq: float = 3.0,
-    fft_cutoff: float = 0.3,
 ) -> dict:
     """Generate previews using CFG decomposition (text-only vs text+concept).
 
@@ -662,6 +762,13 @@ def generate_preview_cfg(
     pairs = [(p, s) for p in prompts for s in seeds]
     outer = tqdm(pairs, desc="Generating CFG previews", disable=not show_progress)
 
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg:
+        with torch.no_grad():
+            neg_hs, neg_mask = encode_prompt(
+                text_encoder, tokenizer, negative_prompt, device
+            )
+
     idx = 0
     for prompt, seed in outer:
         with torch.no_grad():
@@ -681,16 +788,18 @@ def generate_preview_cfg(
                 transformer, scheduler,
                 packed, text_hs, text_mask, concept_hs, concept_mask,
                 height, width, steps,
-                text_scale=1.0, concept_scale=concept_scale,
+                text_scale=text_scale if use_true_cfg else 1.0,
+                concept_scale=concept_scale,
                 show_progress=show_progress,
                 concept_scale_schedule=concept_scale_schedule,
                 scale_high=scale_high,
                 scale_low=scale_low,
-                decomposition=decomposition,
-                scale_low_freq=scale_low_freq,
-                scale_high_freq=scale_high_freq,
-                fft_cutoff=fft_cutoff,
+                negative_hidden_states=neg_hs if use_true_cfg else None,
+                negative_mask=neg_mask if use_true_cfg else None,
+                true_cfg_scale=true_cfg_scale,
+                cfg_normalization=cfg_normalization,
             )
+
             img = _latents_to_pil(vae, denoised, height, width)
 
         scale_label = f"sched={concept_scale_schedule}" if concept_scale_schedule != "constant" else f"cfg×{concept_scale}"
@@ -731,13 +840,13 @@ def generate_preview_cfg_noise(
     height: int = 512,
     title: str | None = None,
     show_progress: bool = True,
+    negative_prompt: str = "",
+    true_cfg_scale: float = 4.0,
+    text_scale: float = 4.0,
+    cfg_normalization: bool = True,
     concept_scale_schedule: str = "constant",
     scale_high: float = 3.0,
     scale_low: float = 1.5,
-    decomposition: str = "standard",
-    scale_low_freq: float = 2.0,
-    scale_high_freq: float = 3.0,
-    fft_cutoff: float = 0.3,
 ) -> dict:
     """Generate CFG-decomposed previews with noise prior blending.
 
@@ -786,6 +895,13 @@ def generate_preview_cfg_noise(
     pairs = [(p, s) for p in prompts for s in seeds]
     outer = tqdm(pairs, desc="Generating CFG+noise previews", disable=not show_progress)
 
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg:
+        with torch.no_grad():
+            neg_hs, neg_mask = encode_prompt(
+                text_encoder, tokenizer, negative_prompt, device
+            )
+
     idx = 0
     for prompt, seed in outer:
         with torch.no_grad():
@@ -807,15 +923,16 @@ def generate_preview_cfg_noise(
                 transformer, scheduler,
                 packed, text_hs, text_mask, concept_hs, concept_mask,
                 height, width, steps,
-                text_scale=1.0, concept_scale=concept_scale,
+                text_scale=text_scale if use_true_cfg else 1.0,
+                concept_scale=concept_scale,
                 show_progress=show_progress,
                 concept_scale_schedule=concept_scale_schedule,
                 scale_high=scale_high,
                 scale_low=scale_low,
-                decomposition=decomposition,
-                scale_low_freq=scale_low_freq,
-                scale_high_freq=scale_high_freq,
-                fft_cutoff=fft_cutoff,
+                negative_hidden_states=neg_hs if use_true_cfg else None,
+                negative_mask=neg_mask if use_true_cfg else None,
+                true_cfg_scale=true_cfg_scale,
+                cfg_normalization=cfg_normalization,
             )
             img = _latents_to_pil(vae, denoised, height, width)
 

@@ -49,9 +49,11 @@ def generate_cfg_preview(
     steps: int = 20,
     width: int = 512,
     height: int = 512,
+    negative_prompt: str = "",
+    true_cfg_scale: float = 4.0,
+    cfg_normalization: bool = True,
 ) -> dict:
-    """
-    Generate CFG decomposition preview grids with varying concept_scale.
+    """Generate CFG decomposition preview grids with varying concept_scale.
 
     For each concept_scale, generates a prompt x seed grid using _denoise_cfg.
     Also generates a baseline grid using standard _denoise (no concept).
@@ -139,6 +141,13 @@ def generate_cfg_preview(
         text_encodings.append((text_hs, text_mask))
         concept_encodings.append((concept_hs, concept_mask))
 
+    use_true_cfg = true_cfg_scale > 1.0
+    if use_true_cfg:
+        with torch.no_grad():
+            neg_hs, neg_mask = encode_prompt(
+                text_encoder, tokenizer, negative_prompt, device
+            )
+
     # Generate baseline grid (standard _denoise, no concept)
     baseline_images: list[Image.Image] = []
     baseline_labels: list[str] = []
@@ -159,6 +168,10 @@ def generate_cfg_preview(
                     transformer, scheduler,
                     packed, text_hs, text_mask,
                     height, width, steps,
+                    negative_hidden_states=neg_hs if use_true_cfg else None,
+                    negative_mask=neg_mask if use_true_cfg else None,
+                    true_cfg_scale=true_cfg_scale,
+                    cfg_normalization=cfg_normalization,
                 )
                 img = _latents_to_pil(vae, denoised, height, width)
 
@@ -210,8 +223,12 @@ def generate_cfg_preview(
                         packed, text_hs, text_mask,
                         concept_hs, concept_mask,
                         height, width, steps,
-                        text_scale=text_scale,
+                        text_scale=text_scale if use_true_cfg else 1.0,
                         concept_scale=cs,
+                        negative_hidden_states=neg_hs if use_true_cfg else None,
+                        negative_mask=neg_mask if use_true_cfg else None,
+                        true_cfg_scale=true_cfg_scale,
+                        cfg_normalization=cfg_normalization,
                     )
                     img = _latents_to_pil(vae, denoised, height, width)
 
@@ -255,9 +272,24 @@ def generate_cfg_preview(
 
 
 def main() -> None:
-    """CLI entry point for CFG decomposition preview."""
     parser = argparse.ArgumentParser(
         description="Generate CFG decomposition preview grids for concept embeddings."
+    )
+    parser.add_argument(
+        "--text_scale", type=float, default=4.0,
+        help="Text guidance weight on (v_text - v_neg) when true CFG is active",
+    )
+    parser.add_argument(
+        "--negative_prompt", type=str, default="",
+        help="Negative prompt for true CFG (empty = unconditional baseline)",
+    )
+    parser.add_argument(
+        "--true_cfg_scale", type=float, default=4.0,
+        help="Standard CFG weight on (v_pos - v_neg); >1 enables the negative rail",
+    )
+    parser.add_argument(
+        "--no_cfg_normalization", action="store_true",
+        help="Disable the official per-token norm rescale of the combined prediction",
     )
     parser.add_argument(
         "--emb_path", type=str, required=True,
@@ -266,10 +298,6 @@ def main() -> None:
     parser.add_argument(
         "--concept_scales", type=float, nargs="+", default=[1, 2, 3, 4, 5],
         help="Concept scale values to test (default: 0 1 3 5 7)",
-    )
-    parser.add_argument(
-        "--text_scale", type=float, default=7.0,
-        help="Text guidance scale (default: 7.0)",
     )
     parser.add_argument(
         "--output_dir", type=str, default="./output/cfg_test",
@@ -321,6 +349,9 @@ def main() -> None:
         steps=args.steps,
         width=args.width,
         height=args.height,
+        negative_prompt=args.negative_prompt,
+        true_cfg_scale=args.true_cfg_scale,
+        cfg_normalization=not args.no_cfg_normalization,
     )
 
     print("\nResults:")

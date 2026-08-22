@@ -71,6 +71,12 @@ def main():
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--precision", choices=["fp8", "full"], default="fp8")
     p.add_argument("--dit_dtype", choices=["fp8", "bf16"], default="fp8")
+    p.add_argument("--negative_prompt", default="",
+                   help="Negative prompt for true CFG (empty = unconditional baseline)")
+    p.add_argument("--true_cfg_scale", type=float, default=4.0,
+                   help="Standard CFG weight; >1 enables the negative rail")
+    p.add_argument("--text_scale", type=float, default=4.0,
+                   help="Text guidance weight when the negative rail is active")
     p.add_argument("--include_checkpoints", action="store_true", default=False,
                    help="Also run inference on checkpoint files (contain _step in name)")
     args = p.parse_args()
@@ -146,6 +152,9 @@ def main():
             generate_preview_cfg(
                 **common,
                 concept_scale=scale,
+                negative_prompt=args.negative_prompt,
+                true_cfg_scale=args.true_cfg_scale,
+                text_scale=args.text_scale,
                 concept_scale_schedule=sched,
                 scale_high=args.scale_high,
                 scale_low=args.scale_low,

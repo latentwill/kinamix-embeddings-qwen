@@ -35,6 +35,10 @@ def generate_dsci(
     precision: str = "fp8",
     dit_dtype: str = "fp8",
     concept_scale: float = 3.5,
+    negative_prompt: str = "",
+    true_cfg_scale: float = 4.0,
+    text_scale: float = 4.0,
+    no_cfg_normalization: bool = False,
     noise_prior_path: str | None = None,
     noise_blend: float = 0.3,
     scale_schedule: str = "constant",
@@ -96,6 +100,10 @@ def generate_dsci(
         width=width,
         height=height,
         concept_scale=concept_scale,
+        negative_prompt=negative_prompt,
+        true_cfg_scale=true_cfg_scale,
+        text_scale=text_scale,
+        cfg_normalization=not no_cfg_normalization,
     )
 
     if concept_scale != 1.0 and noise_prior_path:
@@ -103,7 +111,6 @@ def generate_dsci(
         result = generate_preview_cfg_noise(
             **common,
             noise_prior=noise_prior,
-            concept_scale=concept_scale,
             noise_blend=noise_blend,
             concept_scale_schedule=scale_schedule,
             scale_high=scale_high,
@@ -112,7 +119,6 @@ def generate_dsci(
     elif concept_scale != 1.0:
         result = generate_preview_cfg(
             **common,
-            concept_scale=concept_scale,
             concept_scale_schedule=scale_schedule,
             scale_high=scale_high,
             scale_low=scale_low,
@@ -140,7 +146,15 @@ def parse_args():
     p.add_argument("--precision", choices=["fp8", "full"], default="fp8")
     p.add_argument("--dit_dtype", choices=["fp8", "bf16"], default="fp8")
     p.add_argument("--concept_scale", type=float, default=3.5,
-                   help="CFG guidance scale (default: 3.5). Set to 1.0 for single-pass")
+                   help="Concept guidance scale on (v_full - v_text). Set to 1.0 for single-pass")
+    p.add_argument("--negative_prompt", default="",
+                   help="Negative prompt for true CFG (empty string = unconditional baseline)")
+    p.add_argument("--true_cfg_scale", type=float, default=4.0,
+                   help="Standard CFG weight on (v_pos - v_neg). >1 enables the negative rail")
+    p.add_argument("--text_scale", type=float, default=4.0,
+                   help="Text guidance weight on (v_text - v_neg) when the negative rail is active")
+    p.add_argument("--no_cfg_normalization", action="store_true",
+                   help="Disable the official per-token norm rescale of the combined prediction")
     p.add_argument("--noise_prior", default=None,
                    help="Path to noise prior .pt file")
     p.add_argument("--noise_blend", type=float, default=0.3,
@@ -167,9 +181,13 @@ if __name__ == "__main__":
         steps=args.steps,
         width=args.width,
         height=args.height,
+        concept_scale=args.concept_scale,
+        negative_prompt=args.negative_prompt,
+        true_cfg_scale=args.true_cfg_scale,
+        text_scale=args.text_scale,
+        no_cfg_normalization=args.no_cfg_normalization,
         precision=args.precision,
         dit_dtype=args.dit_dtype,
-        concept_scale=args.concept_scale,
         noise_prior_path=args.noise_prior,
         noise_blend=args.noise_blend,
         scale_schedule=args.scale_schedule,
